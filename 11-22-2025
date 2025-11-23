@@ -1,0 +1,320 @@
+# Cell 1: imports, utilities, and ExerciseDetector
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from collections import deque, defaultdict
+import math
+import time
+from typing import Tuple
+
+# Diagram path (your uploaded file)
+DIAGRAM_PATH = "/mnt/data/Screenshot 2025-11-22 195821.png"
+
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+
+def angle_between(a: Tuple[float,float], b: Tuple[float,float], c: Tuple[float,float]) -> float:
+    """Return angle (degrees) at point b formed by a-b-c. a,b,c are (x,y) in pixels."""
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    c = np.array(c, dtype=float)
+    ba = a - b
+    bc = c - b
+    norm_ba = np.linalg.norm(ba)
+    norm_bc = np.linalg.norm(bc)
+    if norm_ba == 0 or norm_bc == 0:
+        return 0.0
+    cosang = np.dot(ba, bc) / (norm_ba * norm_bc)
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    ang = float(np.degrees(np.arccos(cosang)))
+    return ang
+
+def pixel_point(landmark, image_w: int, image_h: int) -> Tuple[float,float]:
+    """Convert mediapipe normalized landmark to pixel coords."""
+    return (landmark.x * image_w, landmark.y * image_h)
+
+class AngleSmoother:
+    def __init__(self, maxlen=5):
+        self.q = deque(maxlen=maxlen)
+    def add(self, val):
+        self.q.append(val)
+    def avg(self):
+        return float(sum(self.q) / len(self.q)) if self.q else 0.0
+
+class RepetitionCounter:
+    def __init__(self, up_threshold, down_threshold):
+        self.count = 0
+        self.state = None
+        self.up_threshold = up_threshold
+        self.down_threshold = down_threshold
+    def update(self, value):
+        # value is a scalar metric (angle or separation)
+        if self.state != 'down' and value <= self.down_threshold:
+            self.state = 'down'
+        if self.state == 'down' and value >= self.up_threshold:
+            self.state = 'up'
+            self.count += 1
+        return self.count
+
+def draw_panel(img, text_lines, origin=(10,10), w=380, h=130, alpha=0.78):
+    x,y = origin
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x,y), (x+w, y+h), (20,20,20), -1)
+    cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, img)
+    start_y = y + 28
+    for i, line in enumerate(text_lines):
+        cv2.putText(img, line, (x+14, start_y + i*22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255,255,255), 1, cv2.LINE_AA)
+
+class ExerciseDetector:
+    def __init__(self):
+        self.smoothers = defaultdict(lambda: AngleSmoother(6))
+        self.counters = {
+            'six_inch': RepetitionCounter(up_threshold=75, down_threshold=30),
+            'pushup': RepetitionCounter(up_threshold=160, down_threshold=100),
+            'squat': RepetitionCounter(up_threshold=160, down_threshold=100),
+            'lunge': RepetitionCounter(up_threshold=160, down_threshold=100),
+            'jumping_jack': RepetitionCounter(up_threshold=120, down_threshold=70)
+        }
+        self.plank_start = None
+        self.plank_hold_seconds = 0
+
+    def detect_and_evaluate(self, landmarks, image_w, image_h):
+        # Ensure we have enough landmarks
+        if landmarks is None or len(landmarks) < 33:
+            return {'exercise': 'No Exercise Detected', 'form_ok': False,
+                    'rep_count': {k: v.count for k,v in self.counters.items()}, 'notes': ''}
+        # index aliases for readability
+        NOSE = 0; LEFT_SHOULDER = 11; RIGHT_SHOULDER = 12
+        LEFT_HIP = 23; RIGHT_HIP = 24; LEFT_KNEE = 25; RIGHT_KNEE = 26
+        LEFT_ANKLE = 27; RIGHT_ANKLE = 28; LEFT_ELBOW = 13; RIGHT_ELBOW = 14
+        LEFT_WRIST = 15; RIGHT_WRIST = 16
+
+        # helper to get pixel coords reliably
+        p = lambda idx: pixel_point(landmarks[idx], image_w, image_h)
+        nx = lambda idx: landmarks[idx].x  # normalized x (0..1)
+
+        # compute angles (pixel-based)
+        left_elbow_ang = angle_between(p(LEFT_SHOULDER), p(LEFT_ELBOW), p(LEFT_WRIST))
+        right_elbow_ang = angle_between(p(RIGHT_SHOULDER), p(RIGHT_ELBOW), p(RIGHT_WRIST))
+        elbow_ang = (left_elbow_ang + right_elbow_ang) / 2.0
+        self.smoothers['elbow'].add(elbow_ang)
+
+        left_knee_ang = angle_between(p(LEFT_HIP), p(LEFT_KNEE), p(LEFT_ANKLE))
+        right_knee_ang = angle_between(p(RIGHT_HIP), p(RIGHT_KNEE), p(RIGHT_ANKLE))
+        knee_ang = (left_knee_ang + right_knee_ang) / 2.0
+        self.smoothers['knee'].add(knee_ang)
+
+        left_hip_angle = angle_between(p(LEFT_SHOULDER), p(LEFT_HIP), p(LEFT_KNEE))
+        right_hip_angle = angle_between(p(RIGHT_SHOULDER), p(RIGHT_HIP), p(RIGHT_KNEE))
+        hip_ang = (left_hip_angle + right_hip_angle) / 2.0
+        self.smoothers['hip'].add(hip_ang)
+
+        # torso incline: angle between mid-shoulder -> mid-hip vector and vertical
+        mid_shoulder = ((landmarks[LEFT_SHOULDER].x + landmarks[RIGHT_SHOULDER].x)/2 * image_w,
+                        (landmarks[LEFT_SHOULDER].y + landmarks[RIGHT_SHOULDER].y)/2 * image_h)
+        mid_hip = ((landmarks[LEFT_HIP].x + landmarks[RIGHT_HIP].x)/2 * image_w,
+                   (landmarks[LEFT_HIP].y + landmarks[RIGHT_HIP].y)/2 * image_h)
+        v = np.array(mid_shoulder) - np.array(mid_hip)
+        vnorm = np.linalg.norm(v)
+        if vnorm < 1e-6:
+            torso_incline_deg = 0.0
+        else:
+            vert = np.array([0.0, -1.0])
+            v_unit = v / vnorm
+            torso_incline_deg = float(np.degrees(np.arccos(np.clip(np.dot(v_unit, vert), -1.0, 1.0))))
+        self.smoothers['torso_incline'].add(torso_incline_deg)
+
+        left_shoulder_arm_ang = angle_between(p(LEFT_ELBOW), p(LEFT_SHOULDER), p(LEFT_HIP))
+        right_shoulder_arm_ang = angle_between(p(RIGHT_ELBOW), p(RIGHT_SHOULDER), p(RIGHT_HIP))
+        arm_open_ang = (left_shoulder_arm_ang + right_shoulder_arm_ang) / 2.0
+        self.smoothers['arm_open'].add(arm_open_ang)
+
+        # smoothed values
+        torso_incline = self.smoothers['torso_incline'].avg()
+        elbow = self.smoothers['elbow'].avg()
+        knee = self.smoothers['knee'].avg()
+        hip = self.smoothers['hip'].avg()
+        arm_open = self.smoothers['arm_open'].avg()
+
+        result = {'exercise': 'No Exercise Detected', 'form_ok': False,
+                  'rep_count': {k: v.count for k,v in self.counters.items()}, 'notes': ''}
+
+        # 6-inches vs Push-up (lying vs prone)
+        if torso_incline > 60:
+            # if elbows are bending -> pushups
+            if elbow < 140:
+                # Push-up detected
+                body_ang = angle_between(mid_shoulder, mid_hip, p(RIGHT_ANKLE))
+                form_ok = (body_ang > 150 and elbow <= 110) or (elbow > 150)
+                self.counters['pushup'].update(elbow)
+                result.update({'exercise': 'Push-up', 'form_ok': form_ok,
+                               'rep_count': {k: v.count for k,v in self.counters.items()},
+                               'notes': f"Elbow {elbow:.1f}°, body {body_ang:.1f}°"})
+                return result
+            else:
+                # 6-inches (supine leg raise)
+                self.counters['six_inch'].update(hip)
+                form_ok = (left_knee_ang > 165 and right_knee_ang > 165 and hip >= 70)
+                result.update({'exercise': '6-inches', 'form_ok': form_ok,
+                               'rep_count': {k: v.count for k,v in self.counters.items()},
+                               'notes': f"Hip {hip:.1f}°, knees L{left_knee_ang:.1f} R{right_knee_ang:.1f}"})
+                return result
+
+        # Jumping jacks
+        if torso_incline < 40 and arm_open > 100:
+            self.counters['jumping_jack'].update(arm_open)
+            # ankle separation in pixels:
+            left_ankle_px = p(LEFT_ANKLE); right_ankle_px = p(RIGHT_ANKLE)
+            ankle_sep = abs(left_ankle_px[0] - right_ankle_px[0])
+            leg_sep_ok = (ankle_sep / image_w) > 0.18
+            form_ok = (arm_open > 120 and leg_sep_ok)
+            result.update({'exercise': 'Jumping-Jack', 'form_ok': form_ok,
+                           'rep_count': {k: v.count for k,v in self.counters.items()},
+                           'notes': f"Arm open {arm_open:.1f}°, ankle_sep {ankle_sep:.1f}"})
+            return result
+
+        # Squat vs Lunge
+        if torso_incline < 50:
+            knee_symmetry = abs(left_knee_ang - right_knee_ang)
+            avg_knee = knee
+            # Squat: symmetric knee bending
+            if knee_symmetry < 12 and 60 < avg_knee <= 120:
+                self.counters['squat'].update(avg_knee)
+                form_ok = (avg_knee <= 120 and torso_incline < 40)
+                result.update({'exercise': 'Squat', 'form_ok': form_ok,
+                               'rep_count': {k: v.count for k,v in self.counters.items()},
+                               'notes': f"Knees L{left_knee_ang:.1f} R{right_knee_ang:.1f}, sym {knee_symmetry:.1f}"})
+                return result
+            # Lunge: asymmetric knee angles
+            if knee_symmetry >= 12 and (left_knee_ang < 140 or right_knee_ang < 140):
+                front_knee = left_knee_ang if left_knee_ang < right_knee_ang else right_knee_ang
+                back_knee = right_knee_ang if left_knee_ang < right_knee_ang else left_knee_ang
+                self.counters['lunge'].update(front_knee)
+                form_ok = (front_knee <= 100 and back_knee >= 150)
+                result.update({'exercise': 'Lunge', 'form_ok': form_ok,
+                               'rep_count': {k: v.count for k,v in self.counters.items()},
+                               'notes': f"Front {front_knee:.1f}°, back {back_knee:.1f}°"})
+                return result
+
+        # Plank detection (treated as a hold)
+        shoulder_px = p(LEFT_SHOULDER); hip_px = p(LEFT_HIP); ankle_px = p(LEFT_ANKLE)
+        body_line_angle = angle_between(shoulder_px, hip_px, ankle_px)
+        if torso_incline > 55 and body_line_angle > 150 and elbow > 150:
+            if self.plank_start is None:
+                self.plank_start = time.time()
+                self.plank_hold_seconds = 0
+            else:
+                self.plank_hold_seconds = int(time.time() - self.plank_start)
+            form_ok = (body_line_angle > 160 and elbow > 160)
+            result.update({'exercise': 'Plank', 'form_ok': form_ok,
+                           'rep_count': {k: v.count for k,v in self.counters.items()},
+                           'notes': f"Hold {self.plank_hold_seconds}s, body {body_line_angle:.1f}°"})
+            return result
+        else:
+            # reset plank timer if not holding
+            self.plank_start = None
+            self.plank_hold_seconds = 0
+
+        return result
+
+# Cell 2: main loop - webcam, overlay, and diagram thumbnail
+def run_exercise_detector(diagram_path=DIAGRAM_PATH, camera_id=0):
+    cap = cv2.VideoCapture(camera_id)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera id {camera_id}.")
+    detector = ExerciseDetector()
+    pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+    # Load diagram thumbnail safely
+    thumb = None
+    try:
+        diagram = cv2.imread(diagram_path)
+        if diagram is not None:
+            thumb = cv2.resize(diagram, (220, 110))
+    except Exception:
+        thumb = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't read frame from camera. Exiting loop.")
+            break
+        frame = cv2.flip(frame, 1)  # mirror
+        image_h, image_w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+
+        display_lines = []
+        eval_res = {'exercise': 'No Exercise Detected', 'form_ok': False,
+                    'rep_count': {k: v.count for k,v in detector.counters.items()}, 'notes': ''}
+
+        if results and results.pose_landmarks:
+            mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                                      mp_drawing.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
+                                      mp_drawing.DrawingSpec(color=(200,200,200), thickness=1, circle_radius=1))
+            eval_res = detector.detect_and_evaluate(results.pose_landmarks.landmark, image_w, image_h)
+
+        exercise = eval_res.get('exercise', 'No Exercise Detected')
+        form_ok = eval_res.get('form_ok', False)
+        notes = eval_res.get('notes', '')
+        rep_counts = eval_res.get('rep_count', {k: v.count for k,v in detector.counters.items()})
+
+        display_lines.append(f"Exercise : {exercise}")
+        if exercise != "No Exercise Detected":
+            display_lines.append(f"Form     : {'Correct' if form_ok else 'Incorrect'}")
+            if exercise == 'Plank':
+                display_lines.append(f"Hold     : {detector.plank_hold_seconds}s")
+            else:
+                # map exercise -> counter key
+                ekey = exercise.lower().replace('-', '_').replace(' ', '_')
+                map_map = {
+                    '6_inches': 'six_inch', '6-inches': 'six_inch', '6_inch': 'six_inch',
+                    '6inches': 'six_inch', 'push_up': 'pushup', 'push-up': 'pushup',
+                    'pushup': 'pushup', 'squat': 'squat', 'lunge': 'lunge',
+                    'jumping_jack': 'jumping_jack', 'jumping-jack': 'jumping_jack'
+                }
+                # try to resolve to a known counter
+                cnt_key = map_map.get(ekey, None)
+                if cnt_key is None:
+                    # fallback checks
+                    if 'push' in exercise.lower():
+                        cnt_key = 'pushup'
+                    elif '6' in exercise.lower():
+                        cnt_key = 'six_inch'
+                    elif 'squat' in exercise.lower():
+                        cnt_key = 'squat'
+                    elif 'lunge' in exercise.lower():
+                        cnt_key = 'lunge'
+                    elif 'jump' in exercise.lower():
+                        cnt_key = 'jumping_jack'
+                cnt = rep_counts.get(cnt_key, 0)
+                display_lines.append(f"Reps     : {cnt}")
+            if notes:
+                display_lines.append(notes)
+        else:
+            display_lines.append("Form     : N/A")
+            display_lines.append("Reps     : 0")
+
+        draw_panel(frame, display_lines, origin=(10,10), w=420, h=130, alpha=0.78)
+
+        # thumbnail bottom-right
+        if thumb is not None:
+            th_h, th_w = thumb.shape[:2]
+            x_off = frame.shape[1] - th_w - 12
+            y_off = frame.shape[0] - th_h - 12
+            cv2.rectangle(frame, (x_off-2, y_off-2), (x_off+th_w+2, y_off+th_h+2), (200,200,200), 1)
+            frame[y_off:y_off+th_h, x_off:x_off+th_w] = thumb
+
+        cv2.putText(frame, "Press 'q' to quit.", (12, frame.shape[0]-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230,230,230), 1)
+        cv2.imshow('Exercise Detector', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# To start camera (run this after running Cell 1 and Cell 2)
+# run_exercise_detector()
+#cell 3
+run_exercise_detector()
